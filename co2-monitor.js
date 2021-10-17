@@ -1,201 +1,218 @@
+'use strict';
 const os = require('os');
+const EventEmitter = require('events');
 const usb = require('usb');
 
-const EventEmitter = require('events').EventEmitter;
+/**
+ * CO2-monitor Connection
+ * @class Monitor
+ */
+class CO2Monitor extends EventEmitter {
+    /**
+     * @param {[Object]} options - Optional configuration.
+     * @param {[Number]} options.vid - VendorId of CO2 monitor.
+     * @param {[Number]} options.pid - ProductId of CO2 monitor.
+     * @param {[Boolean]} options.debug - Enable debug tracing of usb connection.
+     * @constructor
+     */
+    constructor(options) {
+        super();
+        const o = options;
+        this._vid = (o && o.vid) || 0x04D9;
+        this._pid = (o && o.pid) || 0xA052;
+        console.log()
+        this._debug = (o && o.debug) || false;
+        // Random key buffer.
+        this._key = Buffer.from([
+            0xc4, 0xc6, 0xc0, 0x92, 0x40, 0x23, 0xdc, 0x96
+        ]);
 
-class Co2Monitor extends EventEmitter {
-  constructor() {
-    super();
+        this._device = null;
+        this._interface = null;
+        this._endpoint = null;
 
-    this.co2Device = null;
-    this.co2Interface = null;
-    this.co2Endpoint = null;
+        this._co2 = null;
+        this._temp = null;
+        this._hum = null;
 
-    this.idVendor = 0x04D9;
-    this.idProduct = 0xA052;
-
-    this.buf = Buffer.alloc(8);
-
-    this.buf.writeUInt8(0xc4, 0);
-    this.buf.writeUInt8(0xc6, 1);
-    this.buf.writeUInt8(0xc0, 2);
-    this.buf.writeUInt8(0x92, 3);
-    this.buf.writeUInt8(0x40, 4);
-    this.buf.writeUInt8(0x23, 5);
-    this.buf.writeUInt8(0xdc, 6);
-    this.buf.writeUInt8(0x96, 7);
-
-    process.on('SIGINT', () => {
-      this.disconnect(function (cb) {
-        if (cb) process.exit();
-      });
-    });
-  }
-
-  setVendorId(vid) {
-    this.idVendor = vid;
-  }
-
-  setProductId(pid) {
-    this.idProduct = pid;
-  }
-
-  getVendorId() {
-    return this.idVendor;
-  }
-
-  getProductId() {
-    return this.idProduct;
-  }
-
-  connect() {
-    this.co2Device = usb.findByIds(this.idVendor, this.idProduct);
-
-    if (!this.co2Device) {
-      this.emit("error", 'CO2 device not found');
-    }
-    else {
-      try {
-        this.co2Device.open();
-
-        if (!this.co2Device.interfaces[0]) {
-          throw new Error('Interface not found on Device!');
+        if (this._debug) {
+            usb.setDebugLevel(4);
         }
-        else {
-          this.co2Interface = this.co2Device.interfaces[0];
+    }
 
-          if (os.platform() === 'linux') {
-            if (this.co2Interface.isKernelDriverActive()) {
-              this.co2Interface.detachKernelDriver();
+    /**
+     * Setup usb connection to CO2 monitor.
+     * @param {Function} callback
+     */
+    connect(callback) {
+        this._device = usb.findByIds(this._vid, this._pid);
+        if (!this._device) {
+            const err = new Error('Device not found!');
+            this.emit('error', err);
+            return callback(err);
+        }
+        // Open device to use control methods.
+        this._device.open();
+        this._interface = this._device.interfaces[0];
+        // Detach linux kernel driver, or won't get endpoint connection.
+        if (os.platform() === 'linux' && this._interface.isKernelDriverActive()) {
+            this._interface.detachKernelDriver();
+        }
+        if (!this._interface) {
+            const err = new Error('Interface not found!');
+            this.emit('error', err);
+            return callback(err);
+        }
+        // Parameters for `libusb_control_transfer`.
+        const bmReqType = 0x21,
+            bReq = 0x09,
+            wValue = 0x0300,
+            wIdx = 0x00;
+        // Setup OUT transfer.
+        this._device.controlTransfer(bmReqType, bReq, wValue, wIdx, this._key, (err) => {
+            if (err) {
+                this.emit('error', err);
+                return callback(err);
             }
-          }
-
-          this.co2Device.controlTransfer(0x21, 0x09, 0x0300, 0x00, this.buf, function (error, data) {
-            if (error) {
-              throw new Error("Error in opening control transfer: " + error);
-            }
-          });
-
-          this.co2Interface.claim();
-          this.co2Endpoint = this.co2Interface.endpoints[0];
-
-          this.emit("connected", this.co2Device);
-        }
-
-      } catch (error) {
-        throw new Error(error);
-      }
-    }
-  }
-
-  disconnect(cb) {
-    try {
-      this.co2Endpoint.stopPoll();
-      this.co2Interface.release(true, (error) => {
-        if (error) {
-          this.emit('error', error);
-        }
-        else {
-          this.co2Device.close();
-          cb(true);
-        }
-      });
-    }
-    catch (error) {
-      throw new Error(error);
-    }
-  }
-
-  startTransfer() {
-    this._startPoll(this.co2Endpoint, (endpoint) => {
-      if (endpoint !== null) {
-        let decryptedData = {
-          co2: null,
-          temperature: null
-        };
-
-        endpoint.on('data', (data) => {
-          let decrypted = this._decrypt(this.buf, data);
-          let values = {};
-
-          let op = decrypted[0];
-          values[op] = decrypted[1] << 8 | decrypted[2];
-
-          if (values[80]) {
-            decryptedData.co2 = values[80];
-            this.emit("co2", decryptedData.co2);
-            if (decryptedData.temperature !== null) this.emit("data", JSON.stringify(decryptedData));
-          }
-
-          if (values[66]) {
-            decryptedData.temperature = (values[66] / 16.0 - 273.15).toFixed(3);
-            this.emit("temp", decryptedData.temperature);
-            if (decryptedData.co2 !== null) this.emit("data", JSON.stringify(decryptedData));
-          }
-
-          if (values[68]) {
-            let RH = (values[68] / 100);
-          }
-
-          this.emit("rawData", data);
-        })
-
-        endpoint.on("error", (error) => {
-          this.emit("error", error);
+            this._interface.claim();
+            this._endpoint = this._interface.endpoints[0];
+            this.emit('connect', this._endpoint);
+            return callback();
         });
+    }
 
-        endpoint.on("end", (error) => { });
-      }
-    });
-  }
+    /**
+     * Close device connection.
+     * @param {Function} callback
+     */
+    disconnect(callback) {
+        this._endpoint.stopPoll(() => {
+            if (os.platform() === 'linux') {
+                this._interface.attachKernelDriver();
+            }
+            this._interface.release(true, (err) => {
+                if (err) {
+                    this.emit('error', err);
+                }
+                this._device.close();
+                this.emit('disconnect');
+                return callback(err);
+            });
+        });
+    }
 
-  _startPoll(endpoint, cb) {
-    try {
-      endpoint.transfer(8, function (error, data) {
-        if (error) {
-          throw new Error(error);
+    /**
+     * Start data transfer from CO2 monitor.
+     * @param {[Function]} callback
+     */
+    transfer(callback) {
+        callback = callback || (() => { });
+        const transLen = 8;
+        this._endpoint.transfer(transLen, (err) => {
+            if (err) {
+                this.emit('error', err);
+                return callback(err);
+            }
+            const nTransfers = 8;
+            this._endpoint.startPoll(nTransfers);
+
+            this._endpoint.on('data', (data) => {
+                // Skip decryption for modern CO2 sensors.
+                const decrypted = data[4] != 0x0d ? CO2Monitor._decrypt(this._key, data) : data;
+                const checksum = decrypted[3],
+                    sum = decrypted.slice(0, 3)
+                        .reduce((s, item) => (s + item), 0) & 0xff;
+                // Validate checksum (or skip if magic byte detected).
+                if (decrypted[4] !== 0x0d || checksum !== sum) {
+                    return this.emit(
+                        'error', new Error('Checksum Error.')
+                    );
+                }
+
+                const op = decrypted[0];
+                const value = decrypted[1] << 8 | decrypted[2];
+                switch (op) {
+                    case 0x42:
+                        // Temperature
+                        this._temp = parseFloat(
+                            (value / 16 - 273.15).toFixed(2)
+                        );
+                        this.emit('temp', this._temp);
+                        break;
+                    case 0x50:
+                        // CO2
+                        this._co2 = value;
+                        this.emit('co2', this._co2);
+                        break;
+                    case 0x41:
+                        // humidity
+                        this._hum = parseFloat(value / 100);
+                        this.emit('hum', this._hum);
+                    default:
+                        break;
+                }
+            });
+            this._endpoint.on('error', (err) =>
+                this.emit('error', err)
+            );
+            return callback();
+        });
+    }
+
+    /**
+     * Get latest Ambient Temperature (Tamb)
+     * @returns {Number}
+     */
+    get temperature() {
+        return this._temp;
+    }
+
+    /**
+     * Get latest Relative Concentration of CO2 (CntR)
+     * @returns {Number}
+     */
+    get co2() {
+        return this._co2;
+    }
+
+    /**
+     * Get latest Relative Air Humidity
+     * @returns {Number}
+     */
+    get humidity() {
+        return this._hum;
+    }
+
+    /**
+     * Decrypt data fetched from CO2 monitor.
+     * @param {Buffer} key
+     * @param {Buffer} data
+     * @see https://hackaday.io/project/5301-reverse-engineering-a-low-cost-usb-co-monitor/log/17909-all-your-base-are-belong-to-us
+     * @static
+     */
+    static _decrypt(key, data) {
+        const cstate = [
+            0x48, 0x74, 0x65, 0x6D, 0x70, 0x39, 0x39, 0x65
+        ];
+        const shuffle = [2, 4, 0, 7, 1, 6, 5, 3];
+        const length = cstate.length;
+        let i;
+        const dataXor = [];
+        for (i = 0; i < length; i++) {
+            const idx = shuffle[i];
+            dataXor[idx] = data[i] ^ key[idx];
         }
-      });
-
-      endpoint.startPoll(8, 64);
-      cb(endpoint);
-    } catch (e) {
-      cb(null);
+        const dataTmp = [];
+        for (i = 0; i < length; i++) {
+            dataTmp[i] = ((dataXor[i] >> 3) | (dataXor[(i - 1 + 8) % 8] << 5)) & 0xff;
+        }
+        const results = [];
+        for (i = 0; i < length; i++) {
+            const ctmp = ((cstate[i] >> 4) | (cstate[i] << 4)) & 0xff;
+            results[i] = ((0x100 + dataTmp[i] - ctmp) & 0xff);
+        }
+        return results;
     }
-  }
-
-  _decrypt(buf, data) {
-    const cstate = [0x48, 0x74, 0x65, 0x6D, 0x70, 0x39, 0x39, 0x65];
-    const shuffle = [2, 4, 0, 7, 1, 6, 5, 3];
-    let i;
-
-    let phase1 = [];
-    for (i = 0; i < shuffle.length; i++) {
-      phase1[shuffle[i]] = data[i];
-    }
-
-    let phase2 = [];
-    for (i = 0; i < 8; i++) {
-      phase2[i] = phase1[i] ^ buf[i];
-    }
-
-    let phase3 = [];
-    for (i = 0; i < 8; i++) {
-      phase3[i] = ((phase2[i] >> 3) | (phase2[(i - 1 + 8) % 8] << 5)) & 0xff;
-    }
-
-    let ctmp = [];
-    for (i = 0; i < 8; i++) {
-      ctmp[i] = ((cstate[i] >> 4) | (cstate[i] << 4)) & 0xff;
-    }
-
-    let out = [];
-    for (i = 0; i < 8; i++) {
-      out[i] = ((0x100 + phase3[i] - ctmp[i]) & 0xff);
-    }
-
-    return out;
-  }
 }
 
-module.exports = Co2Monitor;
+module.exports = CO2Monitor;
